@@ -8,31 +8,21 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
-#include <chrono>
 #include <random>
 #include "philox.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "dit.h"
+#include "dit-sampler.h"
 #include "vae.h"
-#include "qwen3.h"
-#include "tokenizer.h"
-#include "cond.h"
+#include "qwen3-enc.h"
+#include "fsq-detok.h"
+#include "cond-enc.h"
 #include "bpe.h"
 #include "debug.h"
 #include "request.h"
+#include "timer.h"
 #include "audio.h"
-
-struct Timer {
-    std::chrono::steady_clock::time_point t;
-    Timer() : t(std::chrono::steady_clock::now()) {}
-    double ms() const {
-        return std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t).count();
-    }
-    void reset() { t = std::chrono::steady_clock::now(); }
-};
 
 // Minimal WAV writer (16-bit PCM stereo)
 static bool write_wav(const char * path, const float * audio, int T_audio, int sr) {
