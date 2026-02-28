@@ -53,8 +53,8 @@ add_library(acestep-core STATIC
 link_ggml_backends(acestep-core)
 target_include_directories(acestep-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# dit-vae: full pipeline (text-enc + cond + dit + vae + wav)
-add_executable(dit-vae tools/dit-vae.cpp)
+# dit-vae: full pipeline (text-enc + cond + dit + vae + wav) + LoRA support
+add_executable(dit-vae tools/dit-vae.cpp src/dit-lora.cpp)
 target_link_libraries(dit-vae PRIVATE acestep-core)
 link_ggml_backends(dit-vae)
 
