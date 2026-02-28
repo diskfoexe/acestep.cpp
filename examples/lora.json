@@ -1,0 +1,11 @@
+{
+  "task_type": "text2music",
+  "caption": "Emotional vocal track with soft synths",
+  "lyrics": "",
+  "duration": 10,
+  "inference_steps": 8,
+  "guidance_scale": 1,
+  "shift": 3,
+  "seed": 42,
+  "vocal_language": "en"
+}

@@ -146,10 +146,13 @@ cd examples
 ./cover.sh            # cover mode: decode precomputed audio_codes (no LLM)
 ./cover-reference.sh  # cover + reference_audio for timbre (WAV/MP3; needs reference.wav or .mp3)
 ./test-reference.sh   # reference_audio (WAV or MP3) + audio_cover_strength
+./lora.sh             # DiT + LoRA adapter (e.g. duckdbot/acestep-lora-cryda; put adapter in examples/lora/)
 ```
 
 Each example has a `-sft` variant (SFT model, 50 steps, CFG 7.0)
 alongside the turbo default (8 steps, no CFG). For **reference timbre**, set `reference_audio` to a **WAV or MP3** path; dit-vae loads it (MP3 decoded in memory via header-only minimp3, no temp files), encodes with the VAE encoder (requires a full VAE GGUF that includes encoder weights).
+
+**LoRA adapters**: use `--lora <path>` and optional `--lora-scale <float>` with dit-vae to run the DiT with a PEFT-style LoRA (e.g. [duckdbot/acestep-lora-cryda](https://huggingface.co/duckdbot/acestep-lora-cryda)). Adapter must be `adapter_model.safetensors` (safetensors with `lora_A` / `lora_B` keys matching `decoder.layers.*`). Put the file in `examples/lora/` and run `./lora.sh`, or pass the path explicitly.
 
 ## Generation modes
 
@@ -253,6 +256,10 @@ Required:
   --text-encoder <gguf>   Text encoder GGUF file
   --dit <gguf>            DiT GGUF file
   --vae <gguf>            VAE GGUF file
+
+LoRA:
+  --lora <path>           LoRA adapter (adapter_model.safetensors)
+  --lora-scale <float>    LoRA scale, e.g. alpha/rank (default: 1.0)
 
 Batch:
   --batch <N>             DiT variations per request (default: 1, max 9)
