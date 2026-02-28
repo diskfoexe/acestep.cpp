@@ -46,3 +46,16 @@ jobs:
 
       - name: Run examples (CI fixtures, short duration)
         run: chmod +x examples/run-examples-ci.sh && ./examples/run-examples-ci.sh
+
+      - name: Upload generated audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-audio
+          path: |
+            examples/dit-only0.wav
+            examples/cover0.wav
+            examples/cover-reference0.wav
+            examples/request-reference0.wav
+            examples/simple00.wav
+            examples/partial00.wav
+            examples/full00.wav
