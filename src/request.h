@@ -19,7 +19,11 @@ struct AceRequest {
     // text content
     std::string caption;            // ""
     std::string lyrics;             // ""
-    bool        instrumental;       // false
+    bool        instrumental;      // false
+
+    // LoRA / style trigger (appended to caption for condition encoder when set)
+    std::string custom_tag;         // "" e.g. "crydamoure"
+    std::string genre;             // "" e.g. "Nu-disco"
 
     // metadata (user-provided or LLM-enriched)
     int         bpm;                // 0 = unset

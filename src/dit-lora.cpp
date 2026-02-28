@@ -9,7 +9,7 @@
 #include <unordered_map>
 
 // Normalize adapter key to base name: decoder.layers.N.<proj>
-// e.g. "base_model.model.model.decoder.layers.0.self_attn.q_proj.lora_A.default" -> "decoder.layers.0.self_attn.q_proj"
+// Handles: base_model.model.model., base_model.model.; decoder.layers. or layers.; .lora_A.default/.lora_B.default or .lora_A.weight/.lora_B.weight
 static std::string lora_key_to_base(const std::string & key) {
     std::string s = key;
     const char * prefixes[] = { "base_model.model.model.", "base_model.model." };
@@ -20,14 +20,22 @@ static std::string lora_key_to_base(const std::string & key) {
             break;
         }
     }
+    // PEFT-style suffix
     if (s.size() > 14 && s.compare(s.size() - 14, 14, ".lora_A.default") == 0)
         s = s.substr(0, s.size() - 14);
     else if (s.size() > 14 && s.compare(s.size() - 14, 14, ".lora_B.default") == 0)
+        s = s.substr(0, s.size() - 14);
+    else if (s.size() > 14 && s.compare(s.size() - 14, 14, ".lora_A.weight") == 0)
+        s = s.substr(0, s.size() - 14);
+    else if (s.size() > 14 && s.compare(s.size() - 14, 14, ".lora_B.weight") == 0)
         s = s.substr(0, s.size() - 14);
     else if (s.size() > 7 && s.compare(s.size() - 7, 7, ".lora_A") == 0)
         s = s.substr(0, s.size() - 7);
     else if (s.size() > 7 && s.compare(s.size() - 7, 7, ".lora_B") == 0)
         s = s.substr(0, s.size() - 7);
+    // HuggingFace adapter: layers.N -> decoder.layers.N for our DiT naming
+    if (s.size() >= 7 && s.compare(0, 7, "layers.") == 0)
+        s = "decoder." + s;
     return s;
 }
 
@@ -80,17 +88,13 @@ bool dit_ggml_load_lora(DiTGGML * m, const char * lora_path, float scale) {
         fprintf(stderr, "[LoRA] cannot open %s\n", lora_path);
         return false;
     }
-    uint8_t h8[8];
-    if (fread(h8, 1, 8, fp) != 8) {
+    std::unordered_map<std::string, SafeTensorInfo> tensors;
+    if (fseek(fp, 0, SEEK_SET) != 0) {
         fclose(fp);
         return false;
     }
-    uint64_t header_len = (uint64_t)h8[0] | ((uint64_t)h8[1] << 8) | ((uint64_t)h8[2] << 16) | ((uint64_t)h8[3] << 24)
-        | ((uint64_t)h8[4] << 32) | ((uint64_t)h8[5] << 40) | ((uint64_t)h8[6] << 48) | ((uint64_t)h8[7] << 56);
-    uint64_t data_section_start = 8 + header_len;
-
-    std::unordered_map<std::string, SafeTensorInfo> tensors;
     int n = safetensors_parse_lora(fp, &tensors);
+    uint64_t data_section_start = (uint64_t)ftell(fp);
     if (n == 0) {
         fclose(fp);
         fprintf(stderr, "[LoRA] no LoRA tensors found in %s\n", lora_path);

@@ -243,8 +243,11 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        // Extract params
-        const char * caption  = req.caption.c_str();
+        // Extract params (append custom_tag to caption for LoRA/condition so trigger is in text)
+        std::string caption_for_cond = req.caption;
+        if (!req.custom_tag.empty())
+            caption_for_cond += ", " + req.custom_tag;
+        const char * caption  = caption_for_cond.c_str();
         const char * lyrics   = req.lyrics.c_str();
         char bpm_str[16] = "N/A";
         if (req.bpm > 0) snprintf(bpm_str, sizeof(bpm_str), "%d", req.bpm);
