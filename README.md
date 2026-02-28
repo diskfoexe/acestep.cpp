@@ -143,6 +143,8 @@ cd examples
 ./partial.sh          # caption + lyrics + duration
 ./full.sh             # all metadata provided
 ./dit-only.sh         # skip LLM, DiT from noise
+./cover.sh            # cover mode: decode precomputed audio_codes (no LLM)
+./cover-reference.sh  # cover + reference_audio for timbre (WAV/MP3; needs reference.wav or .mp3)
 ./test-reference.sh   # reference_audio (WAV or MP3) + audio_cover_strength
 ```
 
