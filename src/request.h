@@ -22,8 +22,8 @@ struct AceRequest {
     bool        instrumental;      // false
 
     // LoRA / style trigger (appended to caption for condition encoder when set)
-    std::string custom_tag;         // "" e.g. "crydamoure"
-    std::string genre;             // "" e.g. "Nu-disco"
+    std::string custom_tag;         // "" LoRA trigger word
+    std::string genre;             // "" LoRA genre
 
     // metadata (user-provided or LLM-enriched)
     int         bpm;                // 0 = unset
