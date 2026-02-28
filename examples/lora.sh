@@ -7,10 +7,6 @@ cd "$(dirname "$0")"
 ADAPTER="lora/adapter_model.safetensors"
 if [ ! -f "$ADAPTER" ]; then
     echo "LoRA adapter not found at $ADAPTER"
-    echo "Download once (e.g. from Hugging Face):"
-    echo "  mkdir -p lora"
-    echo "  curl -L -o $ADAPTER 'https://huggingface.co/duckdbot/acestep-lora-cryda/resolve/main/adapter_model.safetensors'"
-    echo "Or: pip install hf && huggingface-cli download duckdbot/acestep-lora-cryda adapter_model.safetensors --local-dir lora"
     exit 1
 fi
 
