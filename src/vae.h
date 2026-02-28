@@ -731,10 +731,28 @@ static int vae_encoder_forward(VAEEncoderGGML * m, const float * audio, int T_au
 }
 
 static void vae_encoder_free(VAEEncoderGGML * m) {
-    if (m->sched) ggml_backend_sched_free(m->sched);
-    if (m->buf) ggml_backend_buffer_free(m->buf);
-    if (m->weight_ctx) ggml_free(m->weight_ctx);
-    if (m->backend && m->backend != m->cpu_backend) ggml_backend_free(m->backend);
-    if (m->cpu_backend) ggml_backend_free(m->cpu_backend);
+    // Order: reset sched, free sched (drops refs to graph/alloc), free weight_ctx (tensor metadata),
+    // then buffer (tensor data), then backends. Avoids double free on some GGML backends.
+    if (m->sched) {
+        ggml_backend_sched_reset(m->sched);
+        ggml_backend_sched_free(m->sched);
+        m->sched = NULL;
+    }
+    if (m->weight_ctx) {
+        ggml_free(m->weight_ctx);
+        m->weight_ctx = NULL;
+    }
+    if (m->buf) {
+        ggml_backend_buffer_free(m->buf);
+        m->buf = NULL;
+    }
+    if (m->backend && m->backend != m->cpu_backend) {
+        ggml_backend_free(m->backend);
+        m->backend = NULL;
+    }
+    if (m->cpu_backend) {
+        ggml_backend_free(m->cpu_backend);
+        m->cpu_backend = NULL;
+    }
     *m = {};
 }

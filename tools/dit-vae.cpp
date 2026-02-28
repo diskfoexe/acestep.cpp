@@ -393,7 +393,9 @@ int main(int argc, char ** argv) {
                 if (vae_encoder_load(&enc, vae_gguf)) {
                     int T_audio = n_samples;
                     if (T_audio >= 1920) {
-                        std::vector<float> enc_out((size_t)S_ref * 64);
+                        // Encoder strides 2,4,4,8,8 -> max latent frames = T_audio/2048 + 1
+                        size_t max_lat = (size_t)(T_audio / 2048) + 1;
+                        std::vector<float> enc_out(max_lat * 64);
                         int T_lat = vae_encoder_forward(&enc, wav_stereo.data(), T_audio, enc_out.data());
                         if (T_lat > 0) {
                             size_t copy_frames = (size_t)(T_lat < S_ref ? T_lat : S_ref);
