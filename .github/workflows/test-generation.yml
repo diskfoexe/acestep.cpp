@@ -1,5 +1,6 @@
 # Build, download models (cached), and run short generation tests for various modes.
-# Runs on release (published) or manual trigger only. Uses short duration (5s) and few steps (4).
+# Validate locally first: from repo root run tests/run-generation-tests.sh (after build + ./models.sh).
+# CI runs the same steps. Trigger: release (published) or workflow_dispatch only.
 name: Test generation
 
 on:
@@ -63,8 +64,9 @@ jobs:
 
       - name: Test full pipeline (LLM + DiT, short)
         run: |
+          cp tests/fixtures/ci-text2music.json request.json
           ./build/ace-qwen3 \
-            --request tests/fixtures/ci-text2music.json \
+            --request request.json \
             --model models/acestep-5Hz-lm-4B-Q8_0.gguf
           test -f request0.json
           ./build/dit-vae \

@@ -396,36 +396,33 @@ int main(int argc, char ** argv) {
         int S_ref_actual = S_ref;
         if (!req.reference_audio.empty()) {
             const std::string & ref_path = req.reference_audio;
-            if (ref_path.size() >= 4 && ref_path.compare(ref_path.size() - 4, 4, ".wav") == 0) {
-                std::vector<float> wav_stereo;
-                int n_samples = load_audio_48k_stereo(ref_path.c_str(), &wav_stereo);
-                if (n_samples > 0 && have_vae) {
-                    VAEEncoderGGML enc = {};
-                    if (vae_encoder_load(&enc, vae_gguf)) {
-                        int T_audio = n_samples;
-                        if (T_audio >= 1920) {
-                            int T_lat = T_audio / 1920;
-                            std::vector<float> enc_out((size_t)T_lat * 64);
-                            T_lat = vae_encoder_forward(&enc, wav_stereo.data(), T_audio, enc_out.data());
-                            if (T_lat > 0) {
-                                size_t copy_frames = (size_t)(T_lat < S_ref ? T_lat : S_ref);
-                                memcpy(timbre_feats.data(), enc_out.data(), copy_frames * 64 * sizeof(float));
-                                if (T_lat < S_ref)
-                                    memcpy(timbre_feats.data() + copy_frames * 64, silence_full.data(),
-                                           (S_ref - (int)copy_frames) * 64 * sizeof(float));
-                                S_ref_actual = (int)copy_frames;
-                                if (T_lat > S_ref) S_ref_actual = S_ref;
-                                timbre_ptr = timbre_feats.data();
-                                fprintf(stderr, "[Timbre] encoded %s -> %d frames (25Hz)\n", ref_path.c_str(), S_ref_actual);
-                            }
+            std::vector<float> wav_stereo;
+            int n_samples = load_audio_48k_stereo(ref_path.c_str(), &wav_stereo);
+            if (n_samples > 0 && have_vae) {
+                VAEEncoderGGML enc = {};
+                if (vae_encoder_load(&enc, vae_gguf)) {
+                    int T_audio = n_samples;
+                    if (T_audio >= 1920) {
+                        std::vector<float> enc_out((size_t)S_ref * 64);
+                        int T_lat = vae_encoder_forward(&enc, wav_stereo.data(), T_audio, enc_out.data());
+                        if (T_lat > 0) {
+                            size_t copy_frames = (size_t)(T_lat < S_ref ? T_lat : S_ref);
+                            memcpy(timbre_feats.data(), enc_out.data(), copy_frames * 64 * sizeof(float));
+                            if (T_lat < S_ref)
+                                memcpy(timbre_feats.data() + copy_frames * 64, silence_full.data(),
+                                       (S_ref - (int)copy_frames) * 64 * sizeof(float));
+                            S_ref_actual = (int)copy_frames;
+                            if (T_lat > S_ref) S_ref_actual = S_ref;
+                            timbre_ptr = timbre_feats.data();
+                            fprintf(stderr, "[Timbre] encoded %s -> %d frames (25Hz)\n", ref_path.c_str(), S_ref_actual);
                         }
-                        vae_encoder_free(&enc);
                     }
-                } else if (n_samples <= 0) {
-                    fprintf(stderr, "[Timbre] WARNING: cannot load WAV %s, using silence\n", ref_path.c_str());
-                } else if (!have_vae) {
-                    fprintf(stderr, "[Timbre] WAV requires --vae (with encoder weights); using silence\n");
+                    vae_encoder_free(&enc);
                 }
+            } else if (n_samples <= 0) {
+                fprintf(stderr, "[Timbre] WARNING: cannot load audio %s (use .wav or .mp3), using silence\n", ref_path.c_str());
+            } else if (!have_vae) {
+                fprintf(stderr, "[Timbre] reference_audio requires --vae (with encoder weights); using silence\n");
             }
         }
 

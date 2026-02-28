@@ -6,6 +6,9 @@ tests/*/
 !tests/fixtures/
 !tests/fixtures/*.json
 
+request.json
+request0.json
+tests/fixtures/*0.json
 checkpoints/
 models/
 __pycache__/

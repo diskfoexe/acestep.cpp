@@ -33,7 +33,7 @@ Builds two binaries: `ace-qwen3` (LLM) and `dit-vae` (DiT + VAE).
 
 **CI (GitHub Actions)**  
 - **Build**: on every push/PR, builds on Ubuntu (BLAS) and macOS (Metal); smoke test runs each binary `--help`.  
-- **Test generation**: on manual trigger or push to `main`; builds, caches models, then runs short (5 s, 4 steps) generation for text2music, cover, and full pipeline (LLM → DiT → WAV). See `.github/workflows/`.
+- **Test generation**: on release or manual trigger only; runs the same checks as **local** `tests/run-generation-tests.sh`. Validate locally first (build + `./models.sh`, then `tests/run-generation-tests.sh`), then use CI to confirm. See `.github/workflows/`.
 
 ## Models
 

@@ -680,7 +680,6 @@ static bool vae_encoder_load(VAEEncoderGGML * m, const char * path) {
 static int vae_encoder_forward(VAEEncoderGGML * m, const float * audio, int T_audio,
                                float * latent_out) {
     if (!m->has_encoder || T_audio < 1920) return -1;
-    int T_latent = T_audio / 1920;
 
     ggml_backend_sched_reset(m->sched);
     size_t ctx_size = 4096 * ggml_tensor_overhead() + ggml_graph_overhead();
@@ -717,8 +716,11 @@ static int vae_encoder_forward(VAEEncoderGGML * m, const float * audio, int T_au
     ggml_backend_sched_synchronize(m->sched);
 
     struct ggml_tensor * out = ggml_graph_get_tensor(gf, "enc_out");
-    std::vector<float> tmp(128 * T_latent);
-    ggml_backend_tensor_get(out, tmp.data(), 0, 128 * (size_t)T_latent * sizeof(float));
+    // Encoder strides 2,4,4,8,8 give T_out != T_audio/1920; use actual output shape to avoid read out of bounds
+    int T_latent = (int)out->ne[0];
+    size_t nbytes = (size_t)T_latent * 128 * sizeof(float);
+    std::vector<float> tmp((size_t)T_latent * 128);
+    ggml_backend_tensor_get(out, tmp.data(), 0, nbytes);
     for (int t = 0; t < T_latent; t++)
         for (int c = 0; c < 64; c++)
             latent_out[t * 64 + c] = tmp[t * 128 + c];
