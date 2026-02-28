@@ -277,8 +277,39 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[Pipeline] seed=%lld, steps=%d, guidance=%.1f, shift=%.1f, duration=%.1fs\n",
                 seed, num_steps, guidance_scale, shift, duration);
 
-        // Parse audio codes from request
+        // Parse audio codes from request (or produce from src_audio WAV/MP3)
         std::vector<int> codes_vec = parse_codes_string(req.audio_codes);
+        if (codes_vec.empty() && !req.src_audio.empty() && have_vae) {
+            const std::string & src_path = req.src_audio;
+            std::vector<float> wav_stereo;
+            int n_samples = load_audio_48k_stereo(src_path.c_str(), &wav_stereo);
+            if (n_samples > 0) {
+                int T_audio = n_samples;
+                if (T_audio >= 1920) {
+                    VAEEncoderGGML enc = {};
+                    if (vae_encoder_load(&enc, vae_gguf)) {
+                        size_t max_lat = (size_t)(T_audio / 2048) + 1;
+                        std::vector<float> enc_out(max_lat * 64);
+                        int T_lat = vae_encoder_forward(&enc, wav_stereo.data(), T_audio, enc_out.data());
+                        vae_encoder_free(&enc);
+                        if (T_lat >= FSQ_FRAMES_PER_CODE) {
+                            DetokGGML detok = {};
+                            if (detok_ggml_load(&detok, dit_gguf, model.backend, model.cpu_backend)) {
+                                std::vector<float> codeword_table((size_t)FSQ_N_CODES * FSQ_FRAMES_PER_CODE * 64);
+                                fprintf(stderr, "[Cover] building FSQ codeword table (8000 codes)...\n");
+                                detok_ggml_build_codeword_table(&detok, codeword_table.data());
+                                latent_frames_to_codes(T_lat, enc_out.data(), codeword_table.data(), &codes_vec);
+                                fprintf(stderr, "[Cover] encoded %s -> %zu codes (%.1fs @ 5Hz)\n",
+                                        src_path.c_str(), codes_vec.size(), (float)codes_vec.size() / 5.0f);
+                                detok_ggml_free(&detok);
+                            }
+                        }
+                    }
+                }
+            } else {
+                fprintf(stderr, "[Cover] WARNING: cannot load src_audio %s (use .wav or .mp3), skipping cover-from-file\n", src_path.c_str());
+            }
+        }
         if (!codes_vec.empty())
             fprintf(stderr, "[Pipeline] %zu audio codes (%.1fs @ 5Hz)\n",
                     codes_vec.size(), (float)codes_vec.size() / 5.0f);
