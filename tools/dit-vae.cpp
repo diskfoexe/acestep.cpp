@@ -77,6 +77,7 @@ static void print_usage(const char * prog) {
         "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
         "  --vae-overlap <N>       Overlap frames per side (default: 64)\n\n"
         "Debug:\n"
+        "  --no-fa                 Disable flash attention\n"
         "  --dump <dir>            Dump intermediate tensors\n", prog);
 }
 
@@ -100,10 +101,11 @@ int main(int argc, char ** argv) {
     std::vector<const char *> request_paths;
     const char * text_enc_gguf = NULL;
     const char * dit_gguf      = NULL;
-    const char * vae_gguf       = NULL;
+    const char * vae_gguf      = NULL;
     const char * dump_dir      = NULL;
     const char * lora_path     = NULL;
     float lora_scale            = 1.0f;
+    bool use_fa                = true;
     int batch_n                 = 1;
     int vae_chunk               = 256;
     int vae_overlap             = 64;
@@ -118,6 +120,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--dit") == 0 && i+1 < argc) dit_gguf = argv[++i];
         else if (strcmp(argv[i], "--vae") == 0 && i+1 < argc) vae_gguf = argv[++i];
         else if (strcmp(argv[i], "--dump") == 0 && i+1 < argc) dump_dir = argv[++i];
+        else if (strcmp(argv[i], "--no-fa") == 0) use_fa = false;
         else if (strcmp(argv[i], "--batch") == 0 && i+1 < argc) batch_n = atoi(argv[++i]);
         else if (strcmp(argv[i], "--vae-chunk") == 0 && i+1 < argc) vae_chunk = atoi(argv[++i]);
         else if (strcmp(argv[i], "--vae-overlap") == 0 && i+1 < argc) vae_overlap = atoi(argv[++i]);
@@ -159,6 +162,7 @@ int main(int argc, char ** argv) {
 
     // Load DiT model (once for all requests)
     dit_ggml_init_backend(&model);
+    if (!use_fa) model.use_flash_attn = false;
     fprintf(stderr, "[Load] Backend init: %.1f ms\n", timer.ms());
 
     timer.reset();
@@ -375,6 +379,7 @@ int main(int argc, char ** argv) {
         timer.reset();
         Qwen3GGML text_enc = {};
         qwen3_init_backend(&text_enc);
+        if (!use_fa) text_enc.use_flash_attn = false;
         if (!qwen3_load_text_encoder(&text_enc, text_enc_gguf)) {
             fprintf(stderr, "FATAL: failed to load text encoder\n");
             dit_ggml_free(&model);
@@ -391,30 +396,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[Encode] TextEncoder (%d tokens): %.1f ms\n", S_text, timer.ms());
         debug_dump_2d(&dbg, "text_hidden", text_hidden.data(), S_text, H_text);
 
-        // 5. Lyric embedding (CPU vocab lookup from text encoder embed table)
+        // 5. Lyric embedding (vocab lookup via text encoder)
         timer.reset();
         std::vector<float> lyric_embed(H_text * S_lyric);
-        {
-            GGUFModel gf_te = {};
-            if (!gf_load(&gf_te, text_enc_gguf)) {
-                fprintf(stderr, "FATAL: cannot reopen text encoder GGUF for lyric embed\n");
-                dit_ggml_free(&model);
-                if (have_vae) vae_ggml_free(&vae);
-                return 1;
-            }
-            const void * embed_data = gf_get_data(gf_te, "embed_tokens.weight");
-            if (!embed_data) {
-                fprintf(stderr, "FATAL: embed_tokens.weight not found\n");
-                gf_close(&gf_te);
-                dit_ggml_free(&model);
-                if (have_vae) vae_ggml_free(&vae);
-                return 1;
-            }
-            qwen3_cpu_embed_lookup(embed_data, H_text,
-                                    lyric_ids.data(), S_lyric,
-                                    lyric_embed.data());
-            gf_close(&gf_te);
-        }
+        qwen3_embed_lookup(&text_enc, lyric_ids.data(), S_lyric, lyric_embed.data());
         fprintf(stderr, "[Encode] Lyric vocab lookup (%d tokens): %.1f ms\n", S_lyric, timer.ms());
         debug_dump_2d(&dbg, "lyric_embed", lyric_embed.data(), S_lyric, H_text);
 
@@ -422,6 +407,7 @@ int main(int argc, char ** argv) {
         timer.reset();
         CondGGML cond = {};
         cond_ggml_init_backend(&cond);
+        if (!use_fa) cond.use_flash_attn = false;
         if (!cond_ggml_load(&cond, dit_gguf)) {
             fprintf(stderr, "FATAL: failed to load condition encoder\n");
             dit_ggml_free(&model);
@@ -494,6 +480,7 @@ int main(int argc, char ** argv) {
                 if (have_vae) vae_ggml_free(&vae);
                 return 1;
             }
+            if (!use_fa) detok.use_flash_attn = false;
             fprintf(stderr, "[Load] Detokenizer: %.1f ms\n", timer.ms());
 
             int T_5Hz = (int)codes_vec.size();

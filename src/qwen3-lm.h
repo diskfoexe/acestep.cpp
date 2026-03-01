@@ -45,14 +45,8 @@ struct Qwen3LM {
     WeightCtx wctx;
     ggml_backend_t backend;
     ggml_backend_t cpu_backend;
-    ggml_backend_sched_t sched; // prefill (variable shapes, runs once)
-    ggml_gallocr_t galloc;      // decode  (single GPU, tight loop)
-
-    // CPU-side embed lookup via mmap (avoids ggml_get_rows which lacks
-    // CUDA K-quant support, preventing costly cross-backend tensor copies)
-    GGUFModel gf_mmap;
-    const void * embed_mmap_data;
-    enum ggml_type embed_type;
+    ggml_backend_sched_t sched;
+    bool use_flash_attn;
 
     // KV cache: per-set, per-layer [D, max_seq, Nkv] f16
     struct ggml_context  * kv_ctx;
@@ -150,7 +144,7 @@ static void qw3lm_init_backend(Qwen3LM * m) {
     m->backend = bp.backend;
     m->cpu_backend = bp.cpu_backend;
     m->sched = backend_sched_new(bp, 8192);
-    m->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+    m->use_flash_attn = true;
 }
 
 // Allocate KV cache
@@ -253,19 +247,7 @@ static bool qw3lm_load(Qwen3LM * m, const char * gguf_path, int max_seq_len, int
     }
 
     wctx_alloc(&m->wctx, m->backend);
-
-    // Keep mmap alive for CPU embed dequant lookup
-    m->embed_mmap_data = gf_get_data(gf, "model.embed_tokens.weight");
-    m->embed_type = m->embed_tokens->type;
-    if (!m->embed_mmap_data) {
-        fprintf(stderr, "[LM-Load] FATAL: embed_tokens not found in mmap\n");
-        gf_close(&gf);
-        return false;
-    }
-    m->gf_mmap = gf; // transfer ownership (no gf_close here)
-    fprintf(stderr, "[LM-Load] CPU embed lookup: type=%s, row=%zu bytes\n",
-            ggml_type_name(m->embed_type),
-            ggml_row_size(m->embed_type, c.hidden_size));
+    gf_close(&gf);
 
     // KV cache
     qw3lm_alloc_kv_cache(m, n_kv_sets > 0 ? n_kv_sets : 1);
@@ -287,7 +269,8 @@ static struct ggml_tensor * qw3lm_build_attn(
         struct ggml_tensor * cache_v, // [D, max_seq, Nkv] f16
         int kv_pos,
         int kv_len,
-        int n_tokens) {
+        int n_tokens,
+        bool use_flash_attn = true) {
 
     int D   = c.head_dim;
     int Nh  = c.n_heads;
@@ -356,10 +339,13 @@ static struct ggml_tensor * qw3lm_build_attn(
     struct ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, kv_len, Nkv, nb1, nb2, 0);
     struct ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, kv_len, Nkv, nb1, nb2, 0);
 
-    // Flash attention
+    // Attention (flash or F32 manual fallback)
     float scale = 1.0f / sqrtf((float)D);
-    struct ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32); // F32 accumulation
+    struct ggml_tensor * attn = use_flash_attn
+        ? ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f)
+        : qwen3_attn_f32(ctx, q, k_full, v_full, mask, scale);
+    if (use_flash_attn)
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
 
     // Reshape: [D, Nh, S] -> [Nh*D, S]
     attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
@@ -401,14 +387,12 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens,
         ggml_set_input(mask);
     }
 
-    // Embedding: CPU dequant from mmap, fed as F32 input.
-    // This keeps embed_tokens out of get_rows (no CUDA K-quant support)
-    // and only in mul_mat (lm_head) which has full K-quant CUDA support.
-    struct ggml_tensor * embed_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, n_tokens);
-    ggml_set_name(embed_out, "embed_out");
-    ggml_set_input(embed_out);
+    // Embedding via ggml_get_rows (scheduler handles backend fallback)
+    struct ggml_tensor * token_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(token_ids_t, "token_ids");
+    ggml_set_input(token_ids_t);
 
-    struct ggml_tensor * hidden = embed_out;
+    struct ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, token_ids_t);
 
     // Transformer layers
     for (int l = 0; l < c.n_layers; l++) {
@@ -421,7 +405,7 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens,
         struct ggml_tensor * attn = qw3lm_build_attn(
             ctx, gf, c, ly, norm, positions, mask,
             m->kv_k[kv_set][l], m->kv_v[kv_set][l],
-            kv_pos, kv_len, n_tokens);
+            kv_pos, kv_len, n_tokens, m->use_flash_attn);
 
         // Residual
         hidden = ggml_add(ctx, hidden, attn);
@@ -450,18 +434,8 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens,
     // Schedule + allocate
     ggml_backend_sched_alloc_graph(m->sched, gf);
 
-    // CPU-side embedding dequantization from mmap
-    {
-        const int64_t row_size = (int64_t)ggml_row_size(m->embed_type, H);
-        const ggml_to_float_t to_float = ggml_get_type_traits(m->embed_type)->to_float;
-        std::vector<float> embed_buf((size_t)H * n_tokens);
-        for (int i = 0; i < n_tokens; i++) {
-            const void * row = (const char *)m->embed_mmap_data + (int64_t)token_ids[i] * row_size;
-            to_float(row, embed_buf.data() + (int64_t)i * H, H);
-        }
-        ggml_backend_tensor_set(embed_out, embed_buf.data(), 0,
-            (size_t)H * n_tokens * sizeof(float));
-    }
+    // Set token IDs
+    ggml_backend_tensor_set(token_ids_t, token_ids, 0, n_tokens * sizeof(int));
 
     {
         std::vector<int> pos_data(n_tokens);
@@ -507,7 +481,6 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
                                   const int * kv_sets, int N, float * logits,
                                   int lm_offset = 0, int lm_count = 0) {
     const Qwen3LMConfig & c = m->cfg;
-    int H   = c.hidden_size;
     int D   = c.head_dim;
     int Nh  = c.n_heads;
     int Nkv = c.n_kv_heads;
@@ -530,10 +503,10 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
     struct ggml_context * ctx = ggml_init(gp);
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
 
-    // Embedding: [H, N]
-    struct ggml_tensor * embed_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, N);
-    ggml_set_name(embed_out, "embed_out");
-    ggml_set_input(embed_out);
+    // Embedding via ggml_get_rows (scheduler handles backend fallback)
+    struct ggml_tensor * token_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+    ggml_set_name(token_ids_t, "token_ids");
+    ggml_set_input(token_ids_t);
 
     // Positions: [N], per-element kv_pos
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
@@ -546,7 +519,7 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
     ggml_set_name(attn_mask, "attn_mask");
     ggml_set_input(attn_mask);
 
-    struct ggml_tensor * hidden = embed_out;
+    struct ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, token_ids_t);
 
     for (int l = 0; l < c.n_layers; l++) {
         Qwen3Layer * ly = &m->layers[l];
@@ -639,10 +612,12 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
             m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3],
             (size_t)s0 * m->kv_v4[l]->nb[3]);
 
-        // Batched flash attention: 1 kernel per layer instead of N
-        struct ggml_tensor * attn_result = ggml_flash_attn_ext(ctx,
-            q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
+        // Batched attention (flash or F32 manual fallback)
+        struct ggml_tensor * attn_result = m->use_flash_attn
+            ? ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f)
+            : qwen3_attn_f32(ctx, q4, k_batch, v_batch, attn_mask, scale);
+        if (m->use_flash_attn)
+            ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
 
         // Output: [D, Nh, 1, N] -> [Nh*D, N]
         struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);
@@ -673,20 +648,11 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
     ggml_set_output(lgt);
     ggml_build_forward_expand(gf, lgt);
 
-    // Allocate (gallocr: single-backend, no scheduler overhead)
-    ggml_gallocr_alloc_graph(m->galloc, gf);
+    // Allocate
+    ggml_backend_sched_alloc_graph(m->sched, gf);
 
-    // CPU-side embedding dequant
-    {
-        const int64_t row_size = (int64_t)ggml_row_size(m->embed_type, H);
-        const ggml_to_float_t to_float = ggml_get_type_traits(m->embed_type)->to_float;
-        std::vector<float> embed_buf((size_t)H * N);
-        for (int i = 0; i < N; i++) {
-            const void * row = (const char *)m->embed_mmap_data + (int64_t)token_ids[i] * row_size;
-            to_float(row, embed_buf.data() + (int64_t)i * H, H);
-        }
-        ggml_backend_tensor_set(embed_out, embed_buf.data(), 0, (size_t)H * N * sizeof(float));
-    }
+    // Set token IDs
+    ggml_backend_tensor_set(token_ids_t, token_ids, 0, N * sizeof(int));
 
     // Positions: per-element kv_pos
     {
@@ -710,8 +676,8 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
             mask_data.size() * sizeof(uint16_t));
     }
 
-    // Compute (direct backend, no scheduler dispatch)
-    ggml_backend_graph_compute(m->backend, gf);
+    // Compute
+    ggml_backend_sched_graph_compute(m->sched, gf);
 
     // Read logits [out_V, N]
     ggml_backend_tensor_get(lgt, logits, 0, (size_t)out_V * N * sizeof(float));
@@ -720,18 +686,17 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
     for (int i = 0; i < N; i++)
         m->kv_pos[kv_sets[i]]++;
 
+    ggml_backend_sched_reset(m->sched);
     ggml_free(ctx);
 }
 
 // Free all resources
 static void qw3lm_free(Qwen3LM * m) {
-    if (m->galloc) ggml_gallocr_free(m->galloc);
     if (m->sched) ggml_backend_sched_free(m->sched);
     if (m->kv_buf) ggml_backend_buffer_free(m->kv_buf);
     if (m->kv_ctx) ggml_free(m->kv_ctx);
     if (m->backend && m->backend != m->cpu_backend) ggml_backend_free(m->backend);
     if (m->cpu_backend) ggml_backend_free(m->cpu_backend);
     wctx_free(&m->wctx);
-    gf_close(&m->gf_mmap);
     *m = {};
 }
