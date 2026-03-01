@@ -71,6 +71,7 @@ struct Qwen3GGML {
     ggml_backend_t backend;
     ggml_backend_t cpu_backend;
     ggml_backend_sched_t sched;
+    bool use_flash_attn;
     WeightCtx wctx;
 };
 
@@ -94,6 +95,23 @@ static struct ggml_tensor * qwen3_linear_bias(struct ggml_context * ctx,
     return ggml_add(ctx, out, qwen3_f32(ctx, b));
 }
 
+// F32 manual attention (fallback when flash_attn_ext is disabled).
+// Works for 3D [D, S, X] and 4D [D, S, X, N] inputs.
+// Returns same layout as flash_attn_ext: dims 1 and 2 swapped vs input.
+static struct ggml_tensor * qwen3_attn_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q,
+        struct ggml_tensor * k,
+        struct ggml_tensor * v,
+        struct ggml_tensor * mask,
+        float scale) {
+    struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+    scores = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
+    struct ggml_tensor * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
+    struct ggml_tensor * out = ggml_mul_mat(ctx, vt, scores);
+    return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+}
+
 static struct ggml_tensor * qwen3_rms_norm(struct ggml_context * ctx,
                                             struct ggml_tensor * x,
                                             struct ggml_tensor * w,
@@ -114,7 +132,8 @@ static struct ggml_tensor * qwen3_build_self_attn(
         struct ggml_tensor * x,          // [H, S]
         struct ggml_tensor * positions,  // [S] int32
         struct ggml_tensor * mask,       // [S, S] or NULL
-        int S) {
+        int S,
+        bool use_flash_attn = true) {
 
     int D   = c.head_dim;
     int Nh  = c.n_heads;
@@ -164,10 +183,13 @@ static struct ggml_tensor * qwen3_build_self_attn(
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
-    // 6) Flash attention (handles GQA)
+    // 6) Attention (flash or F32 manual fallback)
     float scale = 1.0f / sqrtf((float)D);
-    struct ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32); // F32 accumulation
+    struct ggml_tensor * attn = use_flash_attn
+        ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f)
+        : qwen3_attn_f32(ctx, q, k, v, mask, scale);
+    if (use_flash_attn)
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
 
     // 7) Reshape back: [D, Nh, S] -> [Nh*D, S]
     attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
@@ -203,11 +225,12 @@ static struct ggml_tensor * qwen3_build_layer(
         struct ggml_tensor * hidden,
         struct ggml_tensor * positions,
         struct ggml_tensor * mask,
-        int S) {
+        int S,
+        bool use_flash_attn = true) {
 
     // Self-attention block
     struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
-    struct ggml_tensor * attn = qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S);
+    struct ggml_tensor * attn = qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn);
     hidden = ggml_add(ctx, hidden, attn);
 
     // MLP block
@@ -227,10 +250,11 @@ static struct ggml_tensor * qwen3_build_layers(
         struct ggml_tensor * hidden,
         struct ggml_tensor * positions,
         struct ggml_tensor * mask,
-        int S) {
+        int S,
+        bool use_flash_attn = true) {
 
     for (int i = 0; i < c.n_layers; i++) {
-        hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S);
+        hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn);
     }
     return qwen3_rms_norm(ctx, hidden, final_norm_w, c.rms_norm_eps);
 }
@@ -287,6 +311,7 @@ static void qwen3_init_backend(Qwen3GGML * m) {
     m->backend = bp.backend;
     m->cpu_backend = bp.cpu_backend;
     m->sched = backend_sched_new(bp, 4096);
+    m->use_flash_attn = true;
 }
 
 // Load standalone text encoder (Qwen3-Embedding) from GGUF
@@ -372,7 +397,8 @@ static void qwen3_forward(Qwen3GGML * m, const int * token_ids, int S, float * o
 
     // N layers + final norm
     struct ggml_tensor * out = qwen3_build_layers(ctx, c, m->layers, m->final_norm,
-                                                   hidden, positions, mask, S);
+                                                   hidden, positions, mask, S,
+                                                   m->use_flash_attn);
     ggml_set_name(out, "output");
     ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
@@ -409,27 +435,33 @@ static void qwen3_forward(Qwen3GGML * m, const int * token_ids, int S, float * o
     ggml_free(ctx);
 }
 
-// CPU vocab lookup utility
-// For lyric embedding: look up token IDs in text encoder's embed table (bf16 -> f32)
-// GGUF keeps mmapped data alive. Output: [H, S] float (H contiguous per token).
-//
-// embed_data: pointer to bf16 weight data [vocab, H] in PyTorch layout (H contiguous per row)
+// Embedding lookup via ggml graph (reuses text encoder weights + scheduler)
 // token_ids: [S] int32
 // output:    [H * S] float (ggml layout: H contiguous, S tokens)
-static void qwen3_cpu_embed_lookup(const void * embed_data, int H,
-                                    const int * token_ids, int S,
-                                    float * output) {
-    const uint16_t * bf16 = (const uint16_t *)embed_data;
-    for (int s = 0; s < S; s++) {
-        int tok = token_ids[s];
-        const uint16_t * row = bf16 + (int64_t)tok * H;
-        float * dst = output + (int64_t)s * H;
-        for (int h = 0; h < H; h++) {
-            // bf16 to f32: shift left 16 bits
-            uint32_t bits = (uint32_t)row[h] << 16;
-            memcpy(&dst[h], &bits, 4);
-        }
-    }
+static void qwen3_embed_lookup(Qwen3GGML * m, const int * token_ids, int S, float * output) {
+    int H = m->cfg.hidden_size;
+
+    size_t ctx_size = 16 * ggml_tensor_overhead() + ggml_graph_overhead();
+    struct ggml_init_params gp = { ctx_size, NULL, true };
+    struct ggml_context * ctx = ggml_init(gp);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    struct ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
+    ggml_set_name(t_ids, "token_ids");
+    ggml_set_input(t_ids);
+
+    struct ggml_tensor * out = ggml_get_rows(ctx, m->embed_tokens, t_ids);
+    ggml_set_name(out, "embed_out");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_sched_alloc_graph(m->sched, gf);
+    ggml_backend_tensor_set(t_ids, token_ids, 0, S * sizeof(int));
+    ggml_backend_sched_graph_compute(m->sched, gf);
+    ggml_backend_tensor_get(out, output, 0, (size_t)H * S * sizeof(float));
+
+    ggml_backend_sched_reset(m->sched);
+    ggml_free(ctx);
 }
 
 // Free
